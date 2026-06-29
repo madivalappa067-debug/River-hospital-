@@ -1,0 +1,14 @@
+{
+  "name": "riverside-health-backend",
+  "version": "1.0.0",
+  "description": "Example backend for the Riverside Health appointment widget — saves bookings and emails staff notifications.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "resend": "^3.4.0"
+  }
+}
