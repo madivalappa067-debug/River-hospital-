@@ -1,64 +1,95 @@
 /**
  * Riverside Health — Example Backend
  * -----------------------------------
- * This is a minimal, working example of the backend piece that's missing
- * from the static widget. It does two things when a booking comes in:
- *   1. Saves it to a local JSON "database" (swap for real Postgres/Mongo later)
- *   2. Sends an email notification to hospital staff (using Resend's API)
+ * Saves bookings to a real Postgres database (via Neon's free tier) and
+ * emails hospital staff a notification when a new one comes in.
  *
  * WHY YOU NEED THIS:
  * The patient-facing widget (hospital-assistant.html) is a static file with
  * no server behind it — it cannot safely hold an email API key or write to
- * a shared database. This server is the missing piece. Deploy it somewhere
- * (Render, Railway, Fly.io, a VPS, etc.), then point the widget at it.
+ * a shared database. This server is the missing piece.
  *
  * SETUP:
- *   1. npm install express cors resend
- *   2. Sign up at https://resend.com (free tier available), get an API key
- *   3. Set environment variables:
+ *   1. npm install express cors resend pg
+ *   2. Create a free database at https://neon.tech, copy its connection string
+ *   3. Sign up at https://resend.com (free tier available), get an API key
+ *   4. Set environment variables on your host (e.g. Render):
+ *        DATABASE_URL=postgresql://user:pass@host/dbname?sslmode=require
  *        RESEND_API_KEY=your_key_here
  *        STAFF_EMAIL=frontdesk@yourhospital.com
- *        FROM_EMAIL=onboarding@yourdomain.com   (must be a verified sender)
- *   4. node server.js
- *   5. In hospital-assistant.html, replace the window.storage.set() call
- *      in finalizeBooking() with:
- *
- *        await fetch('https://your-backend-url.com/api/bookings', {
- *          method: 'POST',
- *          headers: {'Content-Type':'application/json'},
- *          body: JSON.stringify(record)
- *        });
- *
- *   6. In staff-dashboard.html, replace fetchBookings() with a call to
- *      GET /api/bookings instead of window.storage.list()
+ *        FROM_EMAIL=onboarding@resend.dev
+ *        DASHBOARD_PASSWORD=choose_a_real_password
+ *   5. node server.js — on first run it automatically creates the
+ *      "bookings" table if it doesn't exist yet. No manual SQL needed.
  */
 
 const express = require('express');
 const cors = require('cors');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 const { Resend } = require('resend');
 
 const app = express();
 app.use(cors());          // In production, restrict this to your widget's actual domain
 app.use(express.json());
 
-const DB_FILE = path.join(__dirname, 'bookings.json');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
-// ---------- tiny file-based "database" (swap for Postgres/Mongo in production) ----------
-function readBookings(){
-  if(!fs.existsSync(DB_FILE)) return [];
-  try{
-    return JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
-  }catch(e){
-    console.error('Could not read bookings.json:', e);
-    return [];
-  }
+// ---------- Postgres connection ----------
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false } // required for Neon's hosted Postgres
+});
+
+// Creates the bookings table on first run if it doesn't already exist.
+async function ensureTable(){
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS bookings (
+      confirmation_id TEXT PRIMARY KEY,
+      patient_name TEXT NOT NULL,
+      patient_email TEXT NOT NULL,
+      patient_mobile TEXT NOT NULL,
+      insurance TEXT,
+      reason TEXT,
+      department TEXT,
+      appt_date TEXT,
+      appt_time TEXT,
+      reviewed BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+  `);
+  console.log('Bookings table ready.');
 }
 
-function writeBookings(bookings){
-  fs.writeFileSync(DB_FILE, JSON.stringify(bookings, null, 2));
+// ---------- simple password protection for staff-only routes ----------
+// This is a basic safeguard, not full authentication. Good enough for a
+// small pilot; replace with real per-user login before handling real volume.
+function requireDashboardPassword(req, res, next){
+  const provided = req.headers['x-dashboard-password'];
+  if(!process.env.DASHBOARD_PASSWORD){
+    return res.status(500).json({ error: 'Dashboard password not configured on server.' });
+  }
+  if(provided !== process.env.DASHBOARD_PASSWORD){
+    return res.status(401).json({ error: 'Incorrect or missing dashboard password.' });
+  }
+  next();
+}
+
+function rowToBooking(row){
+  return {
+    confirmationId: row.confirmation_id,
+    patient: {
+      name: row.patient_name,
+      email: row.patient_email,
+      mobile: row.patient_mobile,
+      insurance: row.insurance
+    },
+    reason: row.reason,
+    department: row.department,
+    date: row.appt_date,
+    time: row.appt_time,
+    reviewed: row.reviewed,
+    createdAt: row.created_at
+  };
 }
 
 // ---------- routes ----------
@@ -67,16 +98,36 @@ function writeBookings(bookings){
 app.post('/api/bookings', async (req, res) => {
   const record = req.body;
 
-  // Basic server-side validation — never trust the client alone
   if(!record?.patient?.name || !record?.patient?.email || !record?.patient?.mobile){
     return res.status(400).json({ error: 'Missing required patient details.' });
   }
+  if(!record.confirmationId){
+    return res.status(400).json({ error: 'Missing confirmationId.' });
+  }
 
-  const bookings = readBookings();
-  bookings.push(record);
-  writeBookings(bookings);
+  try{
+    await pool.query(
+      `INSERT INTO bookings
+        (confirmation_id, patient_name, patient_email, patient_mobile, insurance, reason, department, appt_date, appt_time)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [
+        record.confirmationId,
+        record.patient.name,
+        record.patient.email,
+        record.patient.mobile,
+        record.patient.insurance || null,
+        record.reason || null,
+        record.department || null,
+        record.date || null,
+        record.time || null
+      ]
+    );
+  }catch(dbErr){
+    console.error('Could not save booking to database:', dbErr);
+    return res.status(500).json({ error: 'Could not save booking.' });
+  }
 
-  // Notify staff by email
+  // Notify staff by email — booking is already saved even if this fails
   try{
     await resend.emails.send({
       from: process.env.FROM_EMAIL,
@@ -99,31 +150,50 @@ app.post('/api/bookings', async (req, res) => {
       `
     });
   }catch(emailErr){
-    // Don't fail the whole booking just because email didn't send —
-    // the booking is already saved, log the error and move on
     console.error('Email notification failed:', emailErr);
   }
 
   res.status(201).json({ success: true, confirmationId: record.confirmationId });
 });
 
-// List all bookings (called by the staff dashboard)
-app.get('/api/bookings', (req, res) => {
-  res.json(readBookings());
+// List all bookings (called by the staff dashboard) — password protected
+app.get('/api/bookings', requireDashboardPassword, async (req, res) => {
+  try{
+    const result = await pool.query('SELECT * FROM bookings ORDER BY created_at DESC');
+    res.json(result.rows.map(rowToBooking));
+  }catch(dbErr){
+    console.error('Could not fetch bookings:', dbErr);
+    res.status(500).json({ error: 'Could not fetch bookings.' });
+  }
 });
 
-// Mark a booking as reviewed (optional — dashboard currently does this client-side only)
-app.patch('/api/bookings/:id/reviewed', (req, res) => {
-  const bookings = readBookings();
-  const booking = bookings.find(b => b.confirmationId === req.params.id);
-  if(!booking) return res.status(404).json({ error: 'Booking not found' });
-  booking.reviewed = true;
-  writeBookings(bookings);
-  res.json({ success: true });
+// Mark a booking as reviewed
+app.patch('/api/bookings/:id/reviewed', requireDashboardPassword, async (req, res) => {
+  try{
+    const result = await pool.query(
+      'UPDATE bookings SET reviewed = TRUE WHERE confirmation_id = $1 RETURNING *',
+      [req.params.id]
+    );
+    if(result.rowCount === 0){
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+    res.json({ success: true });
+  }catch(dbErr){
+    console.error('Could not update booking:', dbErr);
+    res.status(500).json({ error: 'Could not update booking.' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Riverside Health backend running on http://localhost:${PORT}`);
-  console.log(`Bookings stored in: ${DB_FILE}`);
-});
+
+ensureTable()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Riverside Health backend running on http://localhost:${PORT}`);
+      console.log('Connected to Postgres database.');
+    });
+  })
+  .catch(err => {
+    console.error('Could not connect to database on startup:', err);
+    process.exit(1);
+  });
